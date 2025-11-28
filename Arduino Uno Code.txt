@@ -1,0 +1,225 @@
+#include <DHT.h>
+#include <Wire.h>
+#include <cm1106_i2c.h>
+
+#define CM1107            // CM1107N 모듈 사용 시 활성화
+
+/* =========================
+   노드 ID (보드마다 다르게!)
+   1번 보드: 1
+   2번 보드: 2
+   3번 보드: 3
+
+   1번 보드: #define NODE_ID 1
+   2번 보드: #define NODE_ID 2
+   3번 보드: #define NODE_ID 3
+   이렇게만 바꾸고 나머지는 그대로 업로드
+========================= */
+#define NODE_ID 1   // 이 줄만 보드별로 1,2,3 으로 변경
+
+/* =========================
+   핀 정의
+========================= */
+// DHT11
+#define DHT_PIN   2
+#define DHT_TYPE  DHT11
+
+// GP2Y1010AU0F (먼지 센서)
+#define DUST_LED_PIN     7
+#define DUST_ANALOG_PIN  A0
+
+// 객체 생성
+DHT dht(DHT_PIN, DHT_TYPE);
+CM1106_I2C cm1106_i2c;
+
+/* =========================
+   먼지 센서 읽기
+========================= */
+
+float readDustDensity() {
+  // LED 켜서 측정
+  digitalWrite(DUST_LED_PIN, LOW);
+  delayMicroseconds(280);
+
+  int raw = analogRead(DUST_ANALOG_PIN);
+
+  delayMicroseconds(40);
+  digitalWrite(DUST_LED_PIN, HIGH);
+  delayMicroseconds(9680);
+
+  // 0–1023 → 0–5V
+  float voltage = raw * (5.0 / 1024.0);
+
+  // GP2Y1010AU0F 데이터시트 기준 대략식
+  // 0.5V ~ 3.5V → 0 ~ 500µg/m³ 근사
+  float dust = 0.0;
+  if (voltage > 0.5f) {
+    dust = (voltage - 0.5f) * (500.0f / 3.0f);
+  } else {
+    dust = 0.0;
+  }
+  return dust;
+}
+
+/* =========================
+   CO2 센서 읽기 (CM1107N I2C)
+========================= */
+
+int readCO2ppm() {
+  uint8_t ret = cm1106_i2c.measure_result();
+  if (ret != 0) {
+    // 읽기 실패
+    return -1;
+  }
+  return cm1106_i2c.co2;   // 라이브러리가 채워주는 CO2 ppm 값
+}
+
+void printCO2Status() {
+#if defined(CM1107)
+  Serial.println(F("Status >>"));
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_PREHEATING)) {
+    Serial.println(F("Preheating"));
+  } else {
+    Serial.println(F("Preheat complete"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_OPERATING_NORMAL)) {
+    Serial.println(F("Sensor Error"));
+  } else {
+    Serial.println(F("Operating normal"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_OVER_MEASUREMENT_RANGE)) {
+    Serial.println(F("Over Measurement Range"));
+  } else {
+    Serial.println(F("Normal Measurement Range"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_LESS_THAN_MEASUREMENT_RANGE)) {
+    Serial.println(F("Less than Measurement Range"));
+  } else {
+    Serial.println(F("Normal Measurement Range"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_CALIBRATED)) {
+    Serial.println(F("Non-calibrated"));
+  } else {
+    Serial.println(F("Calibrated"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_LIGHT_AGING)) {
+    Serial.println(F("Light Aging"));
+  } else {
+    Serial.println(F("Light Normal"));
+  }
+
+  if (cm1106_i2c.status & (1 << CM1106_I2C_STATUS_CM1107_DRIFT)) {
+    Serial.println(F("Drift"));
+  } else {
+    Serial.println(F("Non-Drift"));
+  }
+
+#else
+  // CM1106 모드용 (참고용)
+  Serial.println(F("Status >>"));
+  switch (cm1106_i2c.status) {
+    case CM1106_I2C_STATUS_PREHEATING:
+      Serial.println(F("Preheating"));
+      break;
+    case CM1106_I2C_STATUS_NORMAL_OPERATION:
+      Serial.println(F("Normal operation"));
+      break;
+    case CM1106_I2C_STATUS_OPERATING_TROUBLE:
+      Serial.println(F("Operating trouble"));
+      break;
+    case CM1106_I2C_STATUS_OUT_OF_FS:
+      Serial.println(F("Out of FS"));
+      break;
+    case CM1106_I2C_STATUS_NON_CALIBRATED:
+      Serial.println(F("Non calibrated"));
+      break;
+  }
+#endif
+}
+
+/* =========================
+   Setup / Loop
+========================= */
+
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  dht.begin();
+
+  pinMode(DUST_LED_PIN, OUTPUT);
+  digitalWrite(DUST_LED_PIN, HIGH);
+
+  // CO2 센서 I2C 초기화
+  cm1106_i2c.begin();
+  delay(1000);
+  cm1106_i2c.read_serial_number(); // 옵션
+  delay(1000);
+  cm1106_i2c.check_sw_version();   // 옵션
+  delay(1000);
+
+  Serial.print(F("Arduino sensor node "));
+  Serial.print(NODE_ID);
+  Serial.println(F(" with DHT11 + GP2Y1010 + CM1107N started."));
+}
+
+void loop() {
+  static unsigned long lastMs = 0;
+  unsigned long now = millis();
+
+  // 5초마다 측정
+  if (now - lastMs >= 5000) {
+    lastMs = now;
+
+    // 1. 먼지
+    float pm25 = readDustDensity();
+
+    // 2. DHT11
+    float temp = dht.readTemperature(); // °C
+    float hum  = dht.readHumidity();    // %
+
+    if (isnan(temp) || isnan(hum)) {
+      temp = -999.0;
+      hum  = -999.0;
+    }
+
+    // 3. CO2 (CM1107N)
+    int co2ppm = readCO2ppm();
+
+    // ===== 디버그 출력 =====
+    Serial.print(F("[DEBUG] node="));
+    Serial.print(NODE_ID);
+    Serial.print(F(" pm25="));
+    Serial.print(pm25);
+    Serial.print(F("  temp="));
+    Serial.print(temp);
+    Serial.print(F("  hum="));
+    Serial.print(hum);
+    Serial.print(F("  co2="));
+    Serial.println(co2ppm);
+
+    if (co2ppm >= 0) {
+      Serial.print(F("Co2 : "));
+      Serial.println(co2ppm);
+      printCO2Status();
+    } else {
+      Serial.println(F("CO2 read error"));
+    }
+
+    // ===== Python → AWS IoT 로 보낼 JSON 한 줄 =====
+    // 3개 보드 모두 이 형식으로 출력 (node 값만 다름)
+    Serial.print('{');
+    Serial.print("\"node\":");     Serial.print(NODE_ID);
+    Serial.print(",\"pm25\":");    Serial.print(pm25, 1);
+    Serial.print(",\"temp\":");    Serial.print(temp, 1);
+    Serial.print(",\"humidity\":");Serial.print(hum, 1);
+    Serial.print(",\"co2\":");     Serial.print(co2ppm);
+    Serial.println('}');
+  }
+}

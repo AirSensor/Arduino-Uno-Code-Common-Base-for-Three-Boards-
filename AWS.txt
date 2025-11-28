@@ -1,0 +1,181 @@
+# node_publish.py - 센서 데이터 시뮬레이터 (collector_forwarder.py 대응 버전)
+from awscrt import io, mqtt
+from awsiot import mqtt_connection_builder
+import json, time, random, os, pathlib, uuid
+
+# ------------------ 설정 ------------------
+ENDPOINT = "a3oedokc29sfh3-ats.iot.ap-southeast-2.amazonaws.com"
+CLIENT_ID = f"sensor-publisher-{uuid.uuid4().hex[:8]}"  # 유니크 ID
+
+PATH_CA   = "node1-RootCA1.pem"
+PATH_CERT = "node1-cert.pem.crt"
+PATH_KEY  = "node1-private.pem.key"
+
+# 센서 토픽 (node_1, 센서 3개씩)
+TOPICS = {
+    # 온도 3채널
+    "temp_1": "sensor/node_1/temp_1",
+    "temp_2": "sensor/node_1/temp_2",
+    "temp_3": "sensor/node_1/temp_3",
+
+    # CO2 3채널
+    "co2_1": "sensor/node_1/co2_1",
+    "co2_2": "sensor/node_1/co2_2",
+    "co2_3": "sensor/node_1/co2_3",
+
+    # PM2.5 3채널
+    "pm25_1": "sensor/node_1/pm25_1",
+    "pm25_2": "sensor/node_1/pm25_2",
+    "pm25_3": "sensor/node_1/pm25_3",
+
+    # PM10 3채널
+    "pm10_1": "sensor/node_1/pm10_1",
+    "pm10_2": "sensor/node_1/pm10_2",
+    "pm10_3": "sensor/node_1/pm10_3",
+}
+
+# 기본 센서 데이터 범위 (평소 값)
+BASE_RANGES = {
+    "temp":  (20.0, 26.0),   # °C
+    "co2":   (450, 800),     # ppm
+    "pm25":  (5, 25),        # µg/m³
+    "pm10":  (10, 40),       # µg/m³
+}
+
+def _abs(p):
+    """경로 자동 탐색"""
+    if os.path.isabs(p):
+        return p
+    here = pathlib.Path(__file__).parent.resolve()
+    for cand in [p, os.path.join(os.getcwd(), p), str(here / p), str(here / "certs" / p)]:
+        if os.path.exists(cand):
+            return cand
+    return p
+
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+# ------------------ 연결 ------------------
+print(f"[{_now()}] Connecting to AWS IoT...")
+print(f"  - endpoint = {ENDPOINT}")
+print(f"  - clientId = {CLIENT_ID}")
+
+elg = io.EventLoopGroup(1)
+resolver = io.DefaultHostResolver(elg)
+bootstrap = io.ClientBootstrap(elg, resolver)
+
+conn = mqtt_connection_builder.mtls_from_path(
+    endpoint=ENDPOINT,
+    cert_filepath=_abs(PATH_CERT),
+    pri_key_filepath=_abs(PATH_KEY),
+    ca_filepath=_abs(PATH_CA),
+    client_id=CLIENT_ID,
+    clean_session=True,
+    keep_alive_secs=30,
+)
+
+try:
+    conn.connect().result(timeout=10)
+    print(f"[{_now()}] ✅ Connected to AWS IoT Core")
+except Exception as e:
+    print(f"[{_now()}] ❌ Connection failed: {e}")
+    exit(1)
+
+# ------------------ collecting ON 보내기 ------------------
+CTRL_TOPIC = "control/node_1/collect"
+try:
+    ctrl_payload = json.dumps({"on": 1})
+    conn.publish(
+        topic=CTRL_TOPIC,
+        payload=ctrl_payload,
+        qos=mqtt.QoS.AT_LEAST_ONCE
+    )
+    print(f"[{_now()}] 📤 CTRL → on=1 (topic: {CTRL_TOPIC})")
+except Exception as e:
+    print(f"[{_now()}] ❌ Failed to send CTRL on=1: {e}")
+
+# ------------------ 센서 데이터 발행 ------------------
+print(f"[{_now()}] 📡 Publishing sensor data...")
+print(f"[{_now()}] Press Ctrl+C to stop\n")
+
+try:
+    batch = 0
+    while True:
+        ts = int(time.time())
+        batch += 1
+
+        # 배치 번호에 따라 스파이크 발생 여부 결정
+        spike = False
+
+        # 10번째 배치마다 강하게 올려서 알림 조건 거의 확실하게 만족
+        if batch % 10 == 0:
+            spike = True
+            print(f"\n[{_now()}] 🔥 SPIKE BATCH #{batch} - CO2/PM 값 크게 올림 (알림 유도)\n")
+
+        for sensor_name, topic in TOPICS.items():
+            # sensor_name 예: temp_1, co2_2, pm25_3 ...
+            if sensor_name.startswith("temp"):
+                base_min, base_max = BASE_RANGES["temp"]
+                value = round(random.uniform(base_min, base_max), 1)
+
+            elif sensor_name.startswith("co2"):
+                base_min, base_max = BASE_RANGES["co2"]
+
+                if spike:
+                    # 환기 알림 조건 쉽게 맞추기:
+                    # CO2_now > 1200 정도로 크게
+                    value = random.randint(1200, 1800)
+                else:
+                    value = random.randint(base_min, base_max)
+
+            elif sensor_name.startswith("pm25"):
+                base_min, base_max = BASE_RANGES["pm25"]
+
+                if spike:
+                    # 먼지 알림 조건: Dust_now > 50
+                    value = random.randint(55, 90)
+                else:
+                    value = random.randint(base_min, base_max)
+
+            elif sensor_name.startswith("pm10"):
+                base_min, base_max = BASE_RANGES["pm10"]
+
+                if spike:
+                    # 먼지 알림 조건: Dust_now > 50
+                    value = random.randint(60, 120)
+                else:
+                    value = random.randint(base_min, base_max)
+
+            else:
+                # 혹시 모르는 기타 센서
+                value = 0
+
+            payload = json.dumps({
+                "ts": ts,
+                "value": value,
+            })
+
+            try:
+                conn.publish(
+                    topic=topic,
+                    payload=payload,
+                    qos=mqtt.QoS.AT_LEAST_ONCE
+                )
+                print(f"[{_now()}] 📤 {sensor_name:8s} → {str(value):>6} (topic: {topic})")
+            except Exception as e:
+                print(f"[{_now()}] ❌ Publish failed for {sensor_name}: {e}")
+
+        print(f"[{_now()}] ✅ Batch #{batch} published ({len(TOPICS)} sensors)\n")
+
+        # collector_forwarder에서 STACK_SIZE=10, CHECK_INTERVAL=60 이니까
+        # 5초 주기로 10개 ≒ 50초 데이터 -> ΔCO2, ΔDust 계산에 충분
+        time.sleep(5)
+
+except KeyboardInterrupt:
+    print(f"\n[{_now()}] 🛑 Stopping...")
+finally:
+    try:
+        conn.disconnect().result()
+        print(f"[{_now()}] ✅ Disconnected")
+    except Exception:
+        pass
